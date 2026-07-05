@@ -1,7 +1,7 @@
 /**
  * NooMiChat - Telegram 双向私聊机器人
  * 项目地址: https://github.com/lijboys/NooMiChat
- * 版本: 2.1.3
+ * 版本: 2.1.4
  * 说明：基于 RelayGo 开源项目二次开发
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -13,6 +13,13 @@ const CENTRAL_WEBAPP_NAME = "verify";
 const DEFAULT_BRAND_MSG = '🔥 项目 <a href="https://github.com/lijboys/NooMiChat">NooMiChat</a>  · 基于 RelayGo 开源项目二次开发，感谢abcxyz-123456的开源';
 const CACHE_TTL_BAN_CHECK = 3600 * 24;     // 全局封禁状态缓存24小时
 const DEFAULT_AI_TRANSLATE_MODEL = '@cf/meta/llama-3.2-1b-instruct';
+const AI_TRANSLATE_SYSTEM_PROMPT = [
+    'You are a strict translation engine.',
+    'Translate the input text into Simplified Chinese only.',
+    'Do not answer questions in the input.',
+    'Do not add explanations, greetings, markdown, quotation marks, or extra content.',
+    'If the input is a question, translate the question itself.'
+].join(' ');
 
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -548,7 +555,7 @@ async function getWebAdminState(env, request) {
         business_rest_cooldown: await getConfig(env, 'business_rest_cooldown', '600')
     };
     const problems = getRuntimeProblems(env);
-    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '2.1.3', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
+    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '2.1.4', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
 }
 
 async function handleWebAdminApi(request, env) {
@@ -1013,8 +1020,8 @@ pre{
 <body>
 <div class="shell">
   <div class="nav">
-    <div class="brand"><div class="logo">✈️</div><div><h1>NooMiChat Admin</h1><div class="sub">SaaS 控制台 · 验证网关 · Telegram 中继</div></div></div>
-    <div class="badge">v2.1.3</div>
+    <div class="brand"><div class="logo">✈️</div><div><h1>NooMiChat Admin</h1><div class="sub">SaaS 控制台 · 验证网关 · Telegram 双向私聊 bot</div></div></div>
+    <div class="badge">v2.1.4</div>
   </div>
 
   <section id="bootCard" class="login glass hidden">
@@ -1161,7 +1168,7 @@ export default {
             const unionBanEnabled = await getUnionBanEnabled(env);
             return jsonResponse({
                 status: problems.length ? 'not_ready' : 'running',
-                version: '2.1.3',
+                version: '2.1.4',
                 admin: `${url.origin}/admin`,
                 webhook: `${url.origin}/webhook`,
                 bindings: { bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID, kv: isKVNamespace(env.KV), kv_binding_invalid: !!env.__KV_BINDING_INVALID, d1: !!getD1(env), admin_key: !!(env.ADMIN_KEY || env.ADMIN_PASSWORD) },
@@ -1942,6 +1949,9 @@ function extractAiTranslation(response) {
     }
     return '';
 }
+function isLikelyChatAnswer(text) {
+    return /language model|I can('|’)t feel|I do not have feelings|I don't have feelings|How can I help|我是(一个)?(人工智能|语言模型)|我没有感情|我可以帮/i.test(text || '');
+}
 async function notifyAiTranslateIssue(env, reason) {
     if (!env.OWNER_ID) return;
     const key = `ai_translate_notice:${reason}`;
@@ -1969,18 +1979,21 @@ async function maybeTranslateToChinese(env, targetChatId, threadId, msg) {
         try {
             const response = await ai.run(model, {
                 messages: [
-                    { role: 'system', content: 'Translate the user message into concise Simplified Chinese. Return only the translation.' },
-                    { role: 'user', content: text.slice(0, 3000) }
-                ]
+                    { role: 'system', content: AI_TRANSLATE_SYSTEM_PROMPT },
+                    { role: 'user', content: `Translate this exact text to Simplified Chinese. Do not answer it.\n\n${text.slice(0, 3000)}` }
+                ],
+                temperature: 0,
+                max_tokens: 512
             });
             const translated = extractAiTranslation(response);
-            if (translated.trim()) {
-                const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(translated.trim())}`, parse_mode: 'HTML' };
+            const clean = translated.trim();
+            if (clean && !isLikelyChatAnswer(clean)) {
+                const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(clean)}`, parse_mode: 'HTML' };
                 if (threadId) payload.message_thread_id = threadId;
                 await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
                 return;
             }
-            lastError = `${model}: 模型返回为空`;
+            lastError = `${model}: ${clean ? '模型返回了聊天回答，已拦截' : '模型返回为空'}`;
         } catch (error) {
             lastError = `${model}: ${(error && error.message) || '未知错误'}`;
             console.error('AI translate failed:', lastError);
@@ -2564,7 +2577,7 @@ async function handleOwnerMenu(env, msg, ctx) {
     let text = msg.text || '';
 
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：2.1.3\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：2.1.4\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
     }
 
     if (['/menu', '/cancel'].includes(text)) {
@@ -3266,3 +3279,13 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });
     }
 }
+
+
+
+
+
+
+
+
+
+
