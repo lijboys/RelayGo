@@ -1,7 +1,7 @@
 /**
  * NooMiChat - Telegram 双向私聊机器人
  * 项目地址: https://github.com/lijboys/NooMiChat
- * 版本: 1.1.23 (Settings Tabs UI)
+ * 版本: 2.1.3
  * 说明：基于 RelayGo 开源项目二次开发
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -12,6 +12,7 @@ const CENTRAL_BOT_USERNAME = "RelayVerifyBot";
 const CENTRAL_WEBAPP_NAME = "verify";
 const DEFAULT_BRAND_MSG = '🔥 项目 <a href="https://github.com/lijboys/NooMiChat">NooMiChat</a>  · 基于 RelayGo 开源项目二次开发，感谢abcxyz-123456的开源';
 const CACHE_TTL_BAN_CHECK = 3600 * 24;     // 全局封禁状态缓存24小时
+const DEFAULT_AI_TRANSLATE_MODEL = '@cf/meta/llama-3.2-1b-instruct';
 
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -33,6 +34,10 @@ function memSet(key, value, ttlMs = MEMORY_CACHE_TTL) {
     if (memCache.size > 2000) memCache.clear(); // 缓存清理，防止内存溢出
 }
 function memDelete(key) { memCache.delete(key); }
+function runBackground(ctx, task) {
+    const promise = Promise.resolve().then(task).catch(error => console.error('background task failed:', error && error.message));
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(promise);
+}
 
 const D1_TABLES_SQL = [
     `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)`,
@@ -177,6 +182,7 @@ async function getUser(env, userId) {
     }
     const kvUser = env.KV ? await env.KV.get(key, { type: 'json' }) : null;
     if (kvUser) memSet(key, kvUser);
+    else memSet(key, null, 60_000);
     return kvUser;
 }
 async function upsertUser(env, user) {
@@ -209,12 +215,17 @@ async function getUserIdByThread(env, threadId) {
 }
 async function getAdmin(env, userId) {
     if (String(userId) === String(env.OWNER_ID)) return { user_id: String(userId), permissions: ALL_PERMISSIONS, is_owner: true };
+    const cacheKey = `admin:${userId}`;
+    const cached = memGet(cacheKey);
+    if (cached !== undefined) return cached;
     const db = getD1(env);
     if (!db) return null;
     await ensureD1Schema(env);
     const row = await db.prepare('SELECT permissions FROM admins WHERE user_id = ?').bind(String(userId)).first();
-    if (!row) return null;
-    return { user_id: String(userId), permissions: JSON.parse(row.permissions || '[]'), is_owner: false };
+    if (!row) { memSet(cacheKey, null, 60_000); return null; }
+    const admin = { user_id: String(userId), permissions: JSON.parse(row.permissions || '[]'), is_owner: false };
+    memSet(cacheKey, admin, 60_000);
+    return admin;
 }
 async function isAdmin(env, userId) { return !!(await getAdmin(env, userId)); }
 async function hasPermission(env, userId, permission) {
@@ -240,6 +251,7 @@ async function addAdmin(env, userId, permissions = ALL_PERMISSIONS) {
     const finalPerms = allowed.length ? allowed : ['reply', 'panel'];
     const now = Date.now();
     await db.prepare('INSERT INTO admins (user_id, permissions, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET permissions = excluded.permissions, updated_at = excluded.updated_at').bind(String(userId), JSON.stringify(finalPerms), now, now).run();
+    memDelete(`admin:${userId}`);
     return finalPerms;
 }
 async function removeAdmin(env, userId) {
@@ -248,6 +260,7 @@ async function removeAdmin(env, userId) {
     if (!db) throw new Error('D1 binding is required to store co-admins');
     await ensureD1Schema(env);
     await db.prepare('DELETE FROM admins WHERE user_id = ?').bind(String(userId)).run();
+    memDelete(`admin:${userId}`);
 }
 async function writeAuditLog(env, actorId, action, targetId = '', detail = {}) {
     const db = getD1(env);
@@ -511,6 +524,12 @@ async function getWebAdminState(env, request) {
         business_status: await getConfig(env, 'business_status', 'open'),
         ai_translate: await getConfig(env, 'ai_translate', '0'),
         union_ban: await getConfig(env, 'union_ban', '0'),
+        antispam: await getConfig(env, 'antispam', '1'),
+        antispam_link: await getConfig(env, 'antispam_link', '1'),
+        antispam_media: await getConfig(env, 'antispam_media', '1'),
+        antispam_keyword: await getConfig(env, 'antispam_keyword', '1'),
+        antispam_autoban: await getConfig(env, 'antispam_autoban', '0'),
+        blocked_keywords: await getConfig(env, 'blocked_keywords', ''),
         verify_captcha_mode: await getConfig(env, 'verify_captcha_mode', 'off'),
         verify_question_mode: verifyQuestionMode,
         verify_combo_mode: await getConfig(env, 'verify_combo_mode', 'question_only'),
@@ -529,7 +548,7 @@ async function getWebAdminState(env, request) {
         business_rest_cooldown: await getConfig(env, 'business_rest_cooldown', '600')
     };
     const problems = getRuntimeProblems(env);
-    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '1.1.23 (Settings Tabs UI)', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
+    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '2.1.3', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
 }
 
 async function handleWebAdminApi(request, env) {
@@ -579,7 +598,7 @@ async function handleWebAdminApi(request, env) {
     }
     if (url.pathname === '/api/config' && request.method === 'POST') {
         const body = await request.json();
-        const allowed = new Set(['business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'union_ban', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_fail_limit', 'verify_inactive_hours', 'verify_inactive_days', 'verify_image_api_url', 'appeal_url', 'local_appeal_url', 'union_appeal_url', 'welcome_msg', 'brand_msg', 'welcome_buttons_text', 'auto_reply_msg']);
+        const allowed = new Set(['business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'union_ban', 'antispam', 'antispam_link', 'antispam_media', 'antispam_keyword', 'antispam_autoban', 'blocked_keywords', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_fail_limit', 'verify_inactive_hours', 'verify_inactive_days', 'verify_image_api_url', 'appeal_url', 'local_appeal_url', 'union_appeal_url', 'welcome_msg', 'brand_msg', 'welcome_buttons_text', 'auto_reply_msg']);
         const keys = [];
         for (const [key, value] of Object.entries(body || {})) {
             if (allowed.has(key)) {
@@ -915,6 +934,8 @@ pre{
   color:#344054
 }
 .hidden{display:none!important}
+.has-admin-cache #loginCard{display:none!important}
+.has-admin-cache #bootCard{display:block!important}
 .hint{margin-top:12px;font-size:13px;line-height:1.65;color:var(--muted)}
 .hint.bad{color:var(--red)}
 .toast{
@@ -972,17 +993,39 @@ pre{
   button,input,select,textarea{transition:none}
 }
 </style>
+<script>
+(function(){
+  try {
+    var ttl = 30 * 24 * 60 * 60 * 1000;
+    var key = localStorage.getItem('noomichat_admin_key') || localStorage.getItem('relaygo_admin_key') || '';
+    var ts = Number(localStorage.getItem('noomichat_admin_key_saved_at') || 0);
+    if (key && (!ts || Date.now() - ts < ttl)) {
+      document.documentElement.className += ' has-admin-cache';
+    } else {
+      localStorage.removeItem('noomichat_admin_key');
+      localStorage.removeItem('relaygo_admin_key');
+      localStorage.removeItem('noomichat_admin_key_saved_at');
+    }
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
 <div class="shell">
   <div class="nav">
     <div class="brand"><div class="logo">✈️</div><div><h1>NooMiChat Admin</h1><div class="sub">SaaS 控制台 · 验证网关 · Telegram 中继</div></div></div>
-    <div class="badge">v1.1.23 · Settings Tabs UI</div>
+    <div class="badge">v2.1.3</div>
   </div>
+
+  <section id="bootCard" class="login glass hidden">
+    <h2>正在进入后台</h2>
+    <div class="muted">已检测到本机缓存的后台密钥，正在验证有效性。</div>
+    <div id="bootMsg" class="hint">如果密钥过期或已修改，会自动回到登录页。</div>
+  </section>
 
   <section id="loginCard" class="login glass">
     <h2>进入管理后台</h2>
-    <div class="muted">输入 Cloudflare 环境变量中的 ADMIN_KEY；未设置时可临时使用 OWNER_ID。</div>
+    <div class="muted">输入 Cloudflare 环境变量中的 ADMIN_KEY；登录成功后会在当前浏览器缓存 30 天。</div>
     <label for="adminKey">后台密码</label>
     <input id="adminKey" type="password" autocomplete="current-password" placeholder="ADMIN_KEY / OWNER_ID">
     <div class="row" style="margin-top:14px"><button id="loginBtn" type="button">进入后台</button><button id="checkBtn" class="secondary" type="button">检查部署</button></div>
@@ -1007,11 +1050,11 @@ pre{
     <section class="settings-layout">
       <nav class="side-tabs glass" aria-label="后台设置分类">
         <div class="side-tabs-inner">
-          <button class="tab-btn active" type="button" data-tab="overview"><span class="ico">⌂</span>总览</button>
-          <button class="tab-btn" type="button" data-tab="runtime"><span class="ico">◐</span>中继</button>
-          <button class="tab-btn" type="button" data-tab="verify"><span class="ico">◆</span>验证</button>
-          <button class="tab-btn" type="button" data-tab="messages"><span class="ico">✎</span>文案</button>
-          <button class="tab-btn" type="button" data-tab="access"><span class="ico">⚿</span>管理</button>
+          <button class="tab-btn active" type="button" data-tab="overview"><span class="ico">⌂</span>部署</button>
+          <button class="tab-btn" type="button" data-tab="runtime"><span class="ico">◐</span>运营</button>
+          <button class="tab-btn" type="button" data-tab="verify"><span class="ico">◆</span>安全</button>
+          <button class="tab-btn" type="button" data-tab="messages"><span class="ico">✎</span>内容</button>
+          <button class="tab-btn" type="button" data-tab="access"><span class="ico">⚿</span>用户</button>
         </div>
       </nav>
       <div class="tab-content">
@@ -1023,21 +1066,25 @@ pre{
           </div>
         </section>
         <section class="tab-panel" data-panel="runtime">
-          <div class="panel-head"><h2>营业与中继</h2><p>控制营业状态、忙碌提示、AI 翻译和联合封禁开关。</p></div>
-          <div class="card glass"><h2>营业与中继</h2><div class="split"><div><label>营业状态</label><select id="business_status"><option value="open">营业中</option><option value="rest">休息中</option></select></div><div><label>休息提示冷却秒数</label><input id="business_rest_cooldown" type="number" min="60"></div></div><label>休息提示</label><textarea id="business_rest_message"></textarea><div class="split"><div><label>AI 翻译</label><select id="ai_translate"><option value="0">关闭</option><option value="1">开启</option></select></div><div><label>联合封禁</label><select id="union_ban"><option value="0">关闭</option><option value="1">开启</option></select></div></div><button id="saveRuntimeBtn" type="button">保存营业设置</button></div>
+          <div class="panel-head"><h2>运营与中继</h2><p>控制营业状态、休息自动回复和 AI 翻译。安全拦截已移动到“安全”。</p></div>
+          <div class="card glass"><h2>营业与中继</h2><div class="split"><div><label>营业状态</label><select id="business_status"><option value="open">营业中</option><option value="rest">休息中</option></select></div><div><label>休息提示冷却秒数</label><input id="business_rest_cooldown" type="number" min="60"></div></div><label>休息提示</label><textarea id="business_rest_message"></textarea><label>AI 翻译</label><select id="ai_translate"><option value="0">关闭</option><option value="1">开启</option></select><button id="saveRuntimeBtn" type="button">保存运营设置</button></div>
         </section>
         <section class="tab-panel" data-panel="verify">
-          <div class="panel-head"><h2>新用户验证</h2><p>设置云端验证码、本地问答、失败封禁和长时间未聊后的重新验证。</p></div>
-          <div class="card glass"><h2>新用户验证</h2><div class="split"><div><label>云端验证码</label><select id="verify_captcha_mode"><option value="off">关闭</option><option value="cloudflare_turnstile">Cloudflare Turnstile</option><option value="google_recaptcha">Google reCAPTCHA</option></select></div><div><label>本地问答</label><select id="verify_question_mode"><option value="off">关闭</option><option value="math">数学题</option><option value="button_math">算术按钮</option><option value="sticker">发送贴纸</option><option value="emoji_choice">表情选择</option><option value="word_button">文字按钮</option><option value="image_digit">图片数字</option><option value="custom_question">自定义问答</option></select></div></div><div class="split"><div><label>组合模式</label><select id="verify_combo_mode"><option value="captcha_only">只验证码</option><option value="question_only">只问答</option><option value="captcha_question">验证码 + 问答</option></select></div><div><label>失败封禁次数</label><input id="verify_fail_limit" type="number" min="1" max="9"></div></div><label>多久不发消息需要重新验证（小时，0关闭）</label><input id="verify_inactive_hours" type="number" min="0" max="8760" placeholder="例如 1、2、6、12、24"><label>图片数字第三方 API（可空，失败自动本地生成）</label><input id="verify_image_api_url" placeholder="https://example.com/verify-image"><label>本地申诉链接（可空，Bot 内申诉仍可用）</label><input id="local_appeal_url"><label>联合封禁申诉链接</label><input id="union_appeal_url"><button id="saveVerifyBtn" type="button">保存验证设置</button><div class="hint">表情选择和文字按钮都是纯聊天内验证，不跳转网页。</div></div>
+          <div class="panel-head"><h2>安全与验证</h2><p>集中管理新用户验证、联合封禁、防骚扰规则和关键词拦截。</p></div>
+          <div class="panel-grid">
+            <div class="card glass"><h2>新用户验证</h2><div class="split"><div><label>云端验证码</label><select id="verify_captcha_mode"><option value="off">关闭</option><option value="cloudflare_turnstile">Cloudflare Turnstile</option><option value="google_recaptcha">Google reCAPTCHA</option></select></div><div><label>本地问答</label><select id="verify_question_mode"><option value="off">关闭</option><option value="math">数学题</option><option value="button_math">算术按钮</option><option value="sticker">发送贴纸/表情</option><option value="emoji_choice">表情选择</option><option value="word_button">文字按钮</option><option value="image_digit">图片数字</option><option value="custom_question">自定义问答</option></select></div></div><div class="split"><div><label>组合模式</label><select id="verify_combo_mode"><option value="captcha_only">只验证码</option><option value="question_only">只问答</option><option value="captcha_question">验证码 + 问答</option></select></div><div><label>失败封禁次数</label><input id="verify_fail_limit" type="number" min="1" max="9"></div></div><label>验证过期/超时周期（小时，0关闭）</label><input id="verify_inactive_hours" type="number" min="0" max="8760" placeholder="例如 1、2、6、12、24"><label>图片数字第三方 API（可空，失败自动本地生成）</label><input id="verify_image_api_url" placeholder="https://example.com/verify-image"><label>联合封禁</label><select id="union_ban"><option value="0">关闭</option><option value="1">开启</option></select><button id="saveVerifyBtn" type="button">保存安全设置</button><div class="hint">表情选择和文字按钮都是纯聊天内验证，不跳转网页。</div></div>
+            <div class="card glass"><h2>防骚扰与关键词</h2><div class="split"><div><label>防骚扰总开关</label><select id="antispam"><option value="1">开启</option><option value="0">关闭</option></select></div><div><label>命中后自动封禁</label><select id="antispam_autoban"><option value="0">关闭</option><option value="1">开启</option></select></div></div><div class="split"><div><label>链接拦截</label><select id="antispam_link"><option value="1">开启</option><option value="0">关闭</option></select></div><div><label>媒体限制</label><select id="antispam_media"><option value="1">开启</option><option value="0">关闭</option></select></div></div><label>关键词拦截</label><select id="antispam_keyword"><option value="1">开启</option><option value="0">关闭</option></select><label>拦截关键词（每行或逗号分隔）</label><textarea id="blocked_keywords" placeholder="广告&#10;推广&#10;spam"></textarea><button id="saveSecurityBtn" type="button">保存防骚扰设置</button></div>
+          </div>
         </section>
         <section class="tab-panel" data-panel="messages">
-          <div class="panel-head"><h2>消息文案</h2><p>修改验证通过欢迎语、自动回复、品牌说明和欢迎按钮。</p></div>
-          <div class="card glass"><h2>消息文案</h2><div class="split"><div><label>欢迎语（支持 HTML 链接）</label><textarea id="welcome_msg" placeholder='例如：欢迎，点击 <a href="https://t.me/xxx">联系客服</a>'></textarea></div><div><label>自动回复</label><textarea id="auto_reply_msg"></textarea></div></div><div class="split"><div><label>底部品牌文案（支持 HTML 链接，留空关闭）</label><textarea id="brand_msg"></textarea></div><div><label>欢迎按钮</label><textarea id="welcome_buttons_text" placeholder="按钮文字 - https://t.me/xxx, 官网 - https://example.com"></textarea></div></div><button id="saveMsgBtn" type="button">保存文案</button><div class="hint">Telegram 文字链接写法：<code>&lt;a href=&quot;https://t.me/xxx&quot;&gt;点击这里&lt;/a&gt;</code>。按钮格式：按钮名 - 链接，多个用英文逗号分隔。</div></div>
+          <div class="panel-head"><h2>内容与文案</h2><p>修改验证通过欢迎语、自动回复、品牌说明和欢迎按钮。</p></div>
+          <div class="card glass"><h2>内容与文案</h2><div class="split"><div><label>欢迎语（支持 HTML 链接）</label><textarea id="welcome_msg" placeholder='例如：欢迎，点击 <a href="https://t.me/xxx">联系客服</a>'></textarea></div><div><label>自动回复</label><textarea id="auto_reply_msg"></textarea></div></div><div class="split"><div><label>底部品牌文案（支持 HTML 链接，留空关闭）</label><textarea id="brand_msg"></textarea></div><div><label>欢迎按钮</label><textarea id="welcome_buttons_text" placeholder="按钮文字 - https://t.me/xxx, 官网 - https://example.com"></textarea></div></div><button id="saveMsgBtn" type="button">保存内容设置</button><div class="hint">Telegram 文字链接写法：<code>&lt;a href=&quot;https://t.me/xxx&quot;&gt;点击这里&lt;/a&gt;</code>。按钮格式：按钮名 - 链接，多个用英文逗号分隔。</div></div>
         </section>
         <section class="tab-panel" data-panel="access">
-          <div class="panel-head"><h2>黑名单与协管</h2><p>管理本地黑名单、申诉处理入口和协管员权限。</p></div>
+          <div class="panel-head"><h2>用户与权限</h2><p>管理本地黑名单、申诉入口和协管员权限。</p></div>
           <div class="panel-grid">
             <div class="card glass"><h2>本地黑名单</h2><div class="split"><div><label>搜索 / 操作 Telegram ID</label><input id="blackUserId" placeholder="输入用户数字 ID"></div><div><label>封禁原因</label><input id="blackReason" placeholder="后台手动封禁"></div></div><div class="row"><button id="searchBlackBtn" class="secondary" type="button">搜索</button><button id="banBlackBtn" class="red" type="button">加入黑名单</button><button id="unbanBlackBtn" class="green" type="button">解除封禁</button><button id="refreshBlackBtn" class="secondary" type="button">刷新列表</button></div><div id="blacklist" class="admin-list" style="margin-top:12px"></div></div>
+            <div class="card glass"><h2>申诉入口</h2><label>本地申诉链接（可空，Bot 内申诉仍可用）</label><input id="local_appeal_url"><label>联合封禁申诉链接</label><input id="union_appeal_url"><button id="saveAccessBtn" type="button">保存申诉设置</button><div class="hint">本地黑名单和联合封禁分开管理，避免误把联合申诉当成本地申诉。</div></div>
             <div class="card glass"><h2>协管管理</h2><div class="split"><div><label>Telegram ID</label><input id="adminUserId" placeholder="例如 123456789"></div><div><label>权限</label><input id="adminPerms" placeholder="reply,panel,ban,config"></div></div><div class="row"><button id="addAdminBtn" type="button">添加/更新协管</button><span class="hint">OWNER_ID 默认全权限，不可删除。</span></div><div id="admins" class="admin-list" style="margin-top:12px"></div></div>
           </div>
         </section>
@@ -1051,21 +1098,25 @@ pre{
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   var NL = String.fromCharCode(10);
-  var configKeys = ['business_status','business_rest_message','business_rest_cooldown','ai_translate','union_ban','verify_captcha_mode','verify_question_mode','verify_combo_mode','verify_fail_limit','verify_inactive_hours','verify_image_api_url','local_appeal_url','union_appeal_url','welcome_msg','brand_msg','welcome_buttons_text','auto_reply_msg'];
+  var ADMIN_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
+  var configKeys = ['business_status','business_rest_message','business_rest_cooldown','ai_translate','union_ban','antispam','antispam_link','antispam_media','antispam_keyword','antispam_autoban','blocked_keywords','verify_captcha_mode','verify_question_mode','verify_combo_mode','verify_fail_limit','verify_inactive_hours','verify_image_api_url','local_appeal_url','union_appeal_url','welcome_msg','brand_msg','welcome_buttons_text','auto_reply_msg'];
   var lastConfig = {};
-  $('adminKey').value = localStorage.getItem('noomichat_admin_key') || localStorage.getItem('relaygo_admin_key') || '';
+  function clearAdminCache(){ localStorage.removeItem('noomichat_admin_key'); localStorage.removeItem('relaygo_admin_key'); localStorage.removeItem('noomichat_admin_key_saved_at'); document.documentElement.classList.remove('has-admin-cache'); }
+  function getCachedAdminKey(){ var key=localStorage.getItem('noomichat_admin_key') || localStorage.getItem('relaygo_admin_key') || ''; var ts=Number(localStorage.getItem('noomichat_admin_key_saved_at') || 0); if(!key) return ''; if(ts && Date.now()-ts>ADMIN_CACHE_TTL){ clearAdminCache(); return ''; } if(!ts) localStorage.setItem('noomichat_admin_key_saved_at',String(Date.now())); return key; }
+  function saveAdminCache(key){ localStorage.setItem('noomichat_admin_key',key); localStorage.setItem('noomichat_admin_key_saved_at',String(Date.now())); localStorage.removeItem('relaygo_admin_key'); }
+  $('adminKey').value = getCachedAdminKey();
   function toast(msg,isBad){ var el=$('toast'); el.textContent=(isBad?'⚠️ ':'✅ ')+msg; el.className='toast '+(isBad?'bad':''); el.style.display='block'; clearTimeout(window.__toastTimer); window.__toastTimer=setTimeout(function(){el.style.display='none';},3600); }
   function h(v){ return String(v==null?'':v).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
   function setBusy(btn,busy){ if(!btn)return; btn.disabled=!!busy; if(busy){btn.dataset.old=btn.textContent; btn.textContent='处理中...';} else if(btn.dataset.old){btn.textContent=btn.dataset.old; delete btn.dataset.old;} }
   async function parseResponse(res){ var text=await res.text(); try{return text?JSON.parse(text):{};}catch(e){return {error:text||('HTTP '+res.status),raw:text};} }
   async function api(path,opt){ opt=opt||{}; var key=$('adminKey').value.trim(); var headers=Object.assign({'content-type':'application/json','x-admin-key':key},opt.headers||{}); var res=await fetch(path,Object.assign({},opt,{headers:headers})); var data=await parseResponse(res); if(!res.ok) throw new Error(data.error||data.raw||res.statusText); return data; }
-  function showLogin(msg,isBad){ $('loginCard').classList.remove('hidden'); $('app').classList.add('hidden'); if(msg){ $('loginMsg').innerHTML=msg; $('loginMsg').className='hint '+(isBad?'bad':''); } }
-  function showApp(){ $('loginCard').classList.add('hidden'); $('app').classList.remove('hidden'); }
+  function showLogin(msg,isBad){ document.documentElement.classList.remove('has-admin-cache'); $('bootCard').classList.add('hidden'); $('loginCard').classList.remove('hidden'); $('app').classList.add('hidden'); if(msg){ $('loginMsg').innerHTML=msg; $('loginMsg').className='hint '+(isBad?'bad':''); } }
+  function showApp(){ document.documentElement.classList.remove('has-admin-cache'); $('bootCard').classList.add('hidden'); $('loginCard').classList.add('hidden'); $('app').classList.remove('hidden'); }
   function activateTab(name){ if(!document.querySelector('.tab-btn[data-tab="'+name+'"]')) name='overview'; document.querySelectorAll('.tab-btn').forEach(function(btn){ btn.classList.toggle('active',btn.dataset.tab===name); }); document.querySelectorAll('.tab-panel').forEach(function(panel){ panel.classList.toggle('active',panel.dataset.panel===name); }); localStorage.setItem('noomichat_admin_tab',name); }
   function fillAdmins(admins){ var box=$('admins'); box.innerHTML=''; if(!admins||!admins.length){ box.innerHTML='<div class="muted">暂无协管</div>'; return; } admins.forEach(function(a){ var item=document.createElement('div'); item.className='admin-item'; var left=document.createElement('div'); left.innerHTML='<code>'+a.user_id+'</code><div class="muted">'+(a.is_owner?'OWNER':'ADMIN')+' · '+(a.permissions||[]).join(',')+'</div>'; var right=document.createElement('button'); right.type='button'; right.className='red'; right.textContent='删除'; right.disabled=!!a.is_owner; right.addEventListener('click',function(){ delAdmin(a.user_id); }); item.appendChild(left); item.appendChild(right); box.appendChild(item); }); }
   function fillBlacklist(items){ var box=$('blacklist'); box.innerHTML=''; if(!items||!items.length){ box.innerHTML='<div class="muted">暂无本地黑名单记录</div>'; return; } items.forEach(function(x){ var u=x.user||{}; var name=((u.first_name||'')+' '+(u.last_name||'')).trim()||'Unknown'; var item=document.createElement('div'); item.className='admin-item'; var left=document.createElement('div'); left.innerHTML='<code>'+h(x.user_id)+'</code><div class="muted">'+h(name)+(u.username?' @'+h(u.username):'')+' · '+(x.lifted_at?'已解封':'封禁中')+'</div><div class="hint">原因：'+h(x.reason||'-')+'</div>'; var right=document.createElement('button'); right.type='button'; right.className=x.lifted_at?'secondary':'green'; right.textContent=x.lifted_at?'已解封':'解封'; right.disabled=!!x.lifted_at; right.addEventListener('click',function(){ unbanBlack(x.user_id); }); item.appendChild(left); item.appendChild(right); box.appendChild(item); }); }
   function fill(s){ showApp(); var cfg=s.settings||{}; lastConfig=Object.assign({},cfg); var runtime=s.runtime||{}; var kv=runtime.kv||{}; var ready=s.status==='running'; $('status').innerHTML='<span class="pill '+(ready?'ok':'warn')+'">'+(ready?'运行中':'配置未就绪')+'</span> '+(s.version||''); $('statWorker').textContent=ready?'OK':'WARN'; $('statKv').textContent=kv.valid?'OK':'NO'; $('statD1').textContent=runtime.d1?'OK':'NO'; $('statGroup').textContent=cfg.group_id?'已绑定':'未绑定'; $('workerInfo').textContent='Worker: '+(cfg.worker_url||'')+NL+'Webhook: '+(cfg.webhook_url||'')+NL+'Group ID: '+(cfg.group_id||'未绑定')+NL+'Runtime: '+JSON.stringify(runtime,null,2); $('openWebhook').href=cfg.webhook_url||'#'; configKeys.forEach(function(k){ if($(k)) $(k).value = cfg[k] == null ? '' : cfg[k]; }); fillAdmins(s.admins||[]); }
-  async function loadState(){ var btn=$('loginBtn'); try{ setBusy(btn,true); localStorage.setItem('noomichat_admin_key',$('adminKey').value.trim()); fill(await api('/api/status')); loadBlacklist(); toast('已进入后台'); } catch(e){ showLogin('<b>登录失败：</b>'+e.message+'<br>请检查 ADMIN_KEY / OWNER_ID。',true); toast(e.message,true); } finally { setBusy(btn,false); } }
+  async function loadState(silent){ var btn=$('loginBtn'); try{ setBusy(btn,true); var key=$('adminKey').value.trim(); if(!key){ showLogin('请输入后台密码。',true); return; } fill(await api('/api/status')); saveAdminCache(key); loadBlacklist(); if(!silent) toast('已进入后台'); } catch(e){ clearAdminCache(); showLogin('<b>登录失败：</b>'+e.message+'<br>请检查 ADMIN_KEY / OWNER_ID。',true); toast(e.message,true); } finally { setBusy(btn,false); } }
   async function runPublicCheck(){ try{ var r=await (await fetch('/')).json(); $('loginMsg').innerHTML='<pre>'+JSON.stringify(r,null,2)+'</pre>'; $('loginMsg').className='hint'; }catch(e){ showLogin('检查失败：'+e.message,true); } }
   async function setWebhook(){ var b=$('webhookBtn'); try{ setBusy(b,true); var r=await api('/api/webhook/set',{method:'POST',body:'{}'}); $('diagBox').textContent=JSON.stringify(r,null,2); toast(r.telegram&&r.telegram.ok?'Webhook 已设置':'设置失败'); await loadState(); }catch(e){toast(e.message,true);}finally{setBusy(b,false);} }
   async function setCommands(){ var b=$('commandsBtn'); try{ setBusy(b,true); var r=await api('/api/commands/set',{method:'POST',body:'{}'}); $('diagBox').textContent=JSON.stringify(r,null,2); toast(r.ok?'菜单已设置':'设置失败'); }catch(e){toast(e.message,true);}finally{setBusy(b,false);} }
@@ -1078,7 +1129,7 @@ pre{
   async function unbanBlack(uid){ uid=uid||$('blackUserId').value.trim(); if(!uid){toast('请输入 Telegram ID',true);return;} try{ var r=await api('/api/blacklist/unban',{method:'POST',body:JSON.stringify({user_id:uid})}); fillBlacklist(r.items||[]); toast('已解除封禁'); }catch(e){toast(e.message,true);} }
   document.querySelectorAll('.tab-btn').forEach(function(btn){ btn.addEventListener('click',function(){ activateTab(btn.dataset.tab); }); });
   activateTab(localStorage.getItem('noomichat_admin_tab') || 'overview');
-  $('loginBtn').addEventListener('click',loadState); $('checkBtn').addEventListener('click',runPublicCheck); $('adminKey').addEventListener('keydown',function(e){ if(e.key==='Enter') loadState(); }); $('webhookBtn').addEventListener('click',setWebhook); $('commandsBtn').addEventListener('click',setCommands); $('diagBtn').addEventListener('click',runDiagnostics); $('refreshBtn').addEventListener('click',loadState); $('saveRuntimeBtn').addEventListener('click',saveConfig); $('saveVerifyBtn').addEventListener('click',saveConfig); $('saveMsgBtn').addEventListener('click',saveConfig); $('addAdminBtn').addEventListener('click',addAdmin); $('searchBlackBtn').addEventListener('click',loadBlacklist); $('refreshBlackBtn').addEventListener('click',function(){ $('blackUserId').value=''; loadBlacklist(); }); $('banBlackBtn').addEventListener('click',banBlack); $('unbanBlackBtn').addEventListener('click',function(){ unbanBlack(); }); if($('adminKey').value) loadState();
+  $('loginBtn').addEventListener('click',function(){ loadState(false); }); $('checkBtn').addEventListener('click',runPublicCheck); $('adminKey').addEventListener('keydown',function(e){ if(e.key==='Enter') loadState(false); }); $('webhookBtn').addEventListener('click',setWebhook); $('commandsBtn').addEventListener('click',setCommands); $('diagBtn').addEventListener('click',runDiagnostics); $('refreshBtn').addEventListener('click',function(){ loadState(false); }); $('saveRuntimeBtn').addEventListener('click',saveConfig); $('saveVerifyBtn').addEventListener('click',saveConfig); $('saveSecurityBtn').addEventListener('click',saveConfig); $('saveMsgBtn').addEventListener('click',saveConfig); $('saveAccessBtn').addEventListener('click',saveConfig); $('addAdminBtn').addEventListener('click',addAdmin); $('searchBlackBtn').addEventListener('click',loadBlacklist); $('refreshBlackBtn').addEventListener('click',function(){ $('blackUserId').value=''; loadBlacklist(); }); $('banBlackBtn').addEventListener('click',banBlack); $('unbanBlackBtn').addEventListener('click',function(){ unbanBlack(); }); if($('adminKey').value) loadState(true);
 })();
 </script>
 </body>
@@ -1110,7 +1161,7 @@ export default {
             const unionBanEnabled = await getUnionBanEnabled(env);
             return jsonResponse({
                 status: problems.length ? 'not_ready' : 'running',
-                version: '1.1.23 (Settings Tabs UI)',
+                version: '2.1.3',
                 admin: `${url.origin}/admin`,
                 webhook: `${url.origin}/webhook`,
                 bindings: { bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID, kv: isKVNamespace(env.KV), kv_binding_invalid: !!env.__KV_BINDING_INVALID, d1: !!getD1(env), admin_key: !!(env.ADMIN_KEY || env.ADMIN_PASSWORD) },
@@ -1136,7 +1187,7 @@ export default {
 // 核心逻辑
 async function handleUpdate(env, update, ctx) {
     const token = env.BOT_TOKEN;
-    await ensureD1Schema(env);
+    runBackground(ctx, () => ensureD1Schema(env));
 
     // 1. 处理回调查询
     if (update.callback_query) {
@@ -1261,7 +1312,7 @@ if (update.callback_query.data && update.callback_query.data.startsWith('reverif
         if (await hasPermission(env, currentUserId, 'panel')) {
             return handleOwnerMenu(env, update.message, ctx);
         }
-        return handleUserPrivateMessage(env, groupId, update.message);
+        return handleUserPrivateMessage(env, groupId, update.message, ctx);
     }
 }
 
@@ -1287,8 +1338,7 @@ function formatUserBrief(userId, userData = {}) {
 }
 function formatUserReplyTarget(userId, userData = {}) {
     const info = userData.user_info || userData || {};
-    const username = info.username ? ` @${escapeHtml(info.username)}` : '';
-    return `<a href="tg://user?id=${userId}">${formatUserName(info)}</a>${username} / <code>${userId}</code>`;
+    return `<a href="tg://user?id=${userId}">${formatUserName(info)}</a> / <code>${userId}</code>`;
 }
 function buildUserIdentityText(userId, userInfo = {}, title = '📩 用户消息') {
     const username = userInfo.username ? `@${escapeHtml(userInfo.username)}` : 'None';
@@ -1313,9 +1363,9 @@ function isUserCommandMessage(msg) {
 }
 async function sendUserForwardFeedback(env, userId, text = '✅ 消息已发送。') {
     const key = `forward_feedback:${userId}`;
-    if (env.KV && await env.KV.get(key)) return;
+    if (memGet(key)) return;
+    memSet(key, '1', 60_000);
     await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: userId, text });
-    if (env.KV) await env.KV.put(key, '1', { expirationTtl: 60 });
 }
 
 async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null, options = {}) {
@@ -1452,11 +1502,10 @@ async function matchesBlockedKeyword(env, text) { if (!text) return null; const 
 async function banUser(env, targetId) { const userTopic = await getUser(env, targetId) || {}; userTopic.is_banned = true; await upsertUser(env, { ...userTopic, user_id: String(targetId) }); memDelete(`user:${targetId}`); }
 async function notifySpamReview(env, groupId, msg, userData, reason) {
     const token = env.BOT_TOKEN; const userId = String(msg.from.id); const targetChatId = (userData && userData.thread_id && groupId) ? groupId : env.OWNER_ID; if (!targetChatId) return;
-    await env.KV.put(`spam:last:${userId}`, JSON.stringify(msg), { expirationTtl: 1800 });
     const name = escapeHtml(`${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim() || 'Unknown');
     const username = msg.from.username ? `@${escapeHtml(msg.from.username)}` : 'None';
     const preview = escapeHtml(getMessageText(msg).slice(0, 500) || '[非文本消息]');
-    const payload = { chat_id: targetChatId, text: `🛡 <b>防骚扰拦截</b>\n\n原因：${escapeHtml(reason)}\n用户：<a href="tg://user?id=${userId}">${name}</a>\nUID：<code>${userId}</code>\n用户名：${username}\n\n内容：\n<pre>${preview}</pre>`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '✅ 放行', callback_data: `spam_allow:${userId}` }, { text: '🚫 封禁', callback_data: `spam_ban:${userId}` }], [{ text: '⭐ 加白名单', callback_data: `spam_trust:${userId}` }]] } };
+    const payload = { chat_id: targetChatId, text: `🛡 <b>防骚扰拦截</b>\n\n原因：${escapeHtml(reason)}\n用户：<a href="tg://user?id=${userId}">${name}</a>\nUID：<code>${userId}</code>\n用户名：${username}\n\n内容预览：\n<pre>${preview}</pre>\n\n<i>为避免存储消息正文，已不缓存原消息；如需继续沟通，请让用户重新发送。</i>`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🚫 封禁', callback_data: `spam_ban:${userId}` }, { text: '⭐ 加白名单', callback_data: `spam_trust:${userId}` }]] } };
     if (userData && userData.thread_id && groupId) payload.message_thread_id = userData.thread_id;
     return tgRequest(token, 'sendMessage', payload);
 }
@@ -1478,6 +1527,10 @@ async function setToggle(env, key) { const current = await getConfig(env, key); 
 function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 function shuffleArray(items) { const arr = [...items]; for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
 function makeChoiceButtons(userId, choices) { return { inline_keyboard: [shuffleArray(choices).map(v => ({ text: String(v), callback_data: `verify:${userId}:${v}` }))] }; }
+function isEmojiOnlyText(text) {
+    const value = String(text || '').trim();
+    return !!value && /^(\p{Extended_Pictographic}|\uFE0F|\u200D|\s)+$/u.test(value);
+}
 function makeDigitSvg(digit) {
     const noise = Array.from({ length: 8 }, () => `<line x1="${randomInt(0, 160)}" y1="${randomInt(0, 80)}" x2="${randomInt(0, 160)}" y2="${randomInt(0, 80)}" stroke="rgba(80,80,80,.35)" stroke-width="1"/>`).join('');
     return `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80" viewBox="0 0 160 80"><rect width="160" height="80" fill="#f5f7fb"/><g transform="translate(80 48) rotate(${randomInt(-15, 15)})"><text text-anchor="middle" font-size="48" font-family="Arial, sans-serif" font-weight="700" fill="#1f2937">${digit}</text></g>${noise}<circle cx="${randomInt(15,145)}" cy="${randomInt(10,70)}" r="3" fill="#60a5fa" opacity=".5"/></svg>`;
@@ -1575,8 +1628,10 @@ async function getLocalAppealUrl(env) { return await getConfig(env, 'local_appea
 async function getUnionAppealUrl(env) { return await getConfig(env, 'union_appeal_url', 'https://t.me/RelayGo/24'); }
 async function getAppealUrl(env) { return getLocalAppealUrl(env); }
 async function getVerifySettings(env) {
-    const legacyMode = await getConfig(env, 'verify_mode', 'off');
-    const captchaMode = await getConfig(env, 'verify_captcha_mode', 'off');
+    const [legacyMode, captchaMode] = await Promise.all([
+        getConfig(env, 'verify_mode', 'off'),
+        getConfig(env, 'verify_captcha_mode', 'off')
+    ]);
     const questionMode = await getConfig(env, 'verify_question_mode', legacyMode === 'off' ? 'off' : legacyMode);
     let comboMode = await getConfig(env, 'verify_combo_mode', captchaMode !== 'off' && questionMode !== 'off' ? 'captcha_question' : (captchaMode !== 'off' ? 'captcha_only' : 'question_only'));
     if (captchaMode === 'off' && questionMode !== 'off' && comboMode === 'captcha_only') comboMode = 'question_only';
@@ -1907,26 +1962,31 @@ async function maybeTranslateToChinese(env, targetChatId, threadId, msg) {
         await notifyAiTranslateIssue(env, '缺少 Workers AI 绑定');
         return;
     }
-    try {
-        const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
-            messages: [
-                { role: 'system', content: 'Translate the user message into concise Simplified Chinese. Return only the translation.' },
-                { role: 'user', content: text.slice(0, 3000) }
-            ]
-        });
-        const translated = extractAiTranslation(response);
-        if (translated.trim()) {
-            const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(translated.trim())}`, parse_mode: 'HTML' };
-            if (threadId) payload.message_thread_id = threadId;
-            await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
-        } else {
-            await notifyAiTranslateIssue(env, '模型返回为空');
+    const configuredModel = await getConfig(env, 'ai_translate_model', DEFAULT_AI_TRANSLATE_MODEL);
+    const models = [...new Set([configuredModel, DEFAULT_AI_TRANSLATE_MODEL, '@cf/meta/llama-3.2-3b-instruct'])];
+    let lastError = '';
+    for (const model of models) {
+        try {
+            const response = await ai.run(model, {
+                messages: [
+                    { role: 'system', content: 'Translate the user message into concise Simplified Chinese. Return only the translation.' },
+                    { role: 'user', content: text.slice(0, 3000) }
+                ]
+            });
+            const translated = extractAiTranslation(response);
+            if (translated.trim()) {
+                const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(translated.trim())}`, parse_mode: 'HTML' };
+                if (threadId) payload.message_thread_id = threadId;
+                await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+                return;
+            }
+            lastError = `${model}: 模型返回为空`;
+        } catch (error) {
+            lastError = `${model}: ${(error && error.message) || '未知错误'}`;
+            console.error('AI translate failed:', lastError);
         }
-    } catch (error) {
-        const message = (error && error.message) || '未知错误';
-        console.error('AI translate failed:', message);
-        await notifyAiTranslateIssue(env, escapeHtml(message).slice(0, 120));
     }
+    await notifyAiTranslateIssue(env, escapeHtml(lastError || '模型返回为空').slice(0, 160));
 }
 function buildBusinessExport(configs) {
     const excluded = new Set(['bot_token', 'owner_id', 'd1', 'db', 'database', 'noomichat_db', 'relaygo_db', 'kv', 'group_id']);
@@ -1981,7 +2041,7 @@ async function buildButtonMathChallenge(env, userId) {
     while (choices.size < 4) choices.add(randomInt(Math.max(1, ans - 6), ans + 6));
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'button_math', ans }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'button_math', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-    return { text: `🔒 <b>安全验证</b>\n\n请选择正确答案：${a} + ${b} = ?`, reply_markup: makeChoiceButtons(userId, [...choices]) };
+    return { text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n请选择正确答案：${a} + ${b} = ?`, reply_markup: makeChoiceButtons(userId, [...choices]) };
 }
 async function buildEmojiChoiceChallenge(env, userId) {
     const emojis = ['🐱', '🐶', '🐼', '🦊', '🐸', '🐵', '🐰', '🦁', '🐯', '🐮'];
@@ -1991,7 +2051,7 @@ async function buildEmojiChoiceChallenge(env, userId) {
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'emoji_choice', ans }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'emoji_choice', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
     return {
-        text: `🔒 <b>安全验证</b>\n\n请点击这个表情：<b>${ans}</b>`,
+        text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n请点击这个表情：<b>${ans}</b>`,
         reply_markup: { inline_keyboard: [shuffleArray([...choices]).map(v => ({ text: v, callback_data: `verify:${userId}:${encodeURIComponent(v)}` }))] }
     };
 }
@@ -2004,7 +2064,7 @@ async function buildWordButtonChallenge(env, userId) {
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'word_button', ans }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'word_button', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
     return {
-        text: `🔒 <b>安全验证</b>\n\n请点击正确按钮：<b>${escapeHtml(ans)}</b>`,
+        text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n请点击正确按钮：<b>${escapeHtml(ans)}</b>`,
         reply_markup: { inline_keyboard: [shuffleArray([...choices]).slice(0, 6).map(v => ({ text: v, callback_data: `verify:${userId}:${encodeURIComponent(v)}` }))] }
     };
 }
@@ -2028,7 +2088,8 @@ async function buildImageDigitChallenge(env, userId) {
                     if (data.image_base64) photo = base64ToBlob(data.image_base64, data.mime || 'image/png');
                     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'image_digit', ans }), { expirationTtl: 180 });
                     await upsertVerifySession(env, userId, 'image_digit_api', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-                    return { photo, filename: `noomichat-verify-api-${userId}.png`, caption: data.caption || '🔒 安全验证：请选择图片中的数字', reply_markup: makeChoiceButtons(userId, [...choices].slice(0, 6)) };
+                    const caption = `${data.caption || '🔒 安全验证：请选择图片中的数字'}\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。`;
+                    return { photo, filename: `noomichat-verify-api-${userId}.png`, caption, reply_markup: makeChoiceButtons(userId, [...choices].slice(0, 6)) };
                 }
             }
         } catch (e) {
@@ -2040,29 +2101,46 @@ async function buildImageDigitChallenge(env, userId) {
     while (choices.size < 4) choices.add(randomInt(0, 9));
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'image_digit', ans }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'image_digit', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-    return { photo: makeDigitPngBlob(ans), filename: `noomichat-verify-${userId}.png`, caption: '🔒 安全验证：请选择图片中的数字', reply_markup: makeChoiceButtons(userId, [...choices]) };
+    return { photo: makeDigitPngBlob(ans), filename: `noomichat-verify-${userId}.png`, caption: '🔒 安全验证：请选择图片中的数字\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。', reply_markup: makeChoiceButtons(userId, [...choices]) };
 }
 async function buildCustomQuestionChallenge(env, userId) {
     const question = await getConfig(env, 'verify_custom_question', '请回复：我不是机器人');
     const answer = await getConfig(env, 'verify_custom_answer', '我不是机器人');
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'custom_question', ans: String(answer).trim().toLowerCase() }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'custom_question', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-    return { text: `🔒 <b>安全验证</b>\n\n${escapeHtml(question)}\n\n请在 2 分钟内完成验证。` };
+    return { text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n${escapeHtml(question)}\n\n请在 2 分钟内完成验证。` };
 }
-async function rememberVerificationMessage(env, userId, msg) {
-    if (!env.KV || !msg) return;
-    const key = `verify_original:${userId}`;
-    const existing = await env.KV.get(key);
-    if (existing) return;
-    await env.KV.put(key, JSON.stringify(msg), { expirationTtl: 1800 });
+async function markUserVerificationPassed(env, userId, msg = null) {
+    const now = Date.now();
+    const userData = await getUser(env, userId);
+    const info = (msg && msg.from) || (userData && userData.user_info) || {};
+    const next = {
+        ...(userData || {}),
+        user_id: String(userId),
+        user_info: info,
+        first_seen: (userData && userData.first_seen) || now,
+        last_seen: now,
+        message_count: (userData && Number(userData.message_count)) || 0,
+        is_verified: true,
+        is_banned: false
+    };
+    await upsertUser(env, next);
+    if (env.KV) await env.KV.put(`user:${userId}`, JSON.stringify(next));
+    memSet(`user:${userId}`, next);
+    return next;
 }
-
-async function pullVerificationMessage(env, userId, fallbackMsg) {
-    if (!env.KV) return fallbackMsg;
-    const key = `verify_original:${userId}`;
-    const saved = await env.KV.get(key, { type: 'json' });
-    await env.KV.delete(key);
-    return saved || fallbackMsg;
+async function finishInitialVerification(env, userId, msg, token) {
+    await markUserVerificationPassed(env, userId, msg);
+    if (env.KV) await env.KV.delete(`verify_original:${userId}`);
+    await sendWelcomeMessage(env, userId, { includeBrand: true });
+    return tgRequest(token, 'sendMessage', {
+        chat_id: userId,
+        text: '✅ 验证通过。为了安全，验证前发送的消息已丢弃，请重新发送。'
+    });
+}
+async function discardVerificationMessage(env, userId) {
+    if (!env.KV) return;
+    await env.KV.delete(`verify_original:${userId}`);
 }
 async function startQuestionVerification(env, groupId, msg, userId, token, mode) {
     if (mode === 'sticker') {
@@ -2070,14 +2148,14 @@ async function startQuestionVerification(env, groupId, msg, userId, token, mode)
         await upsertVerifySession(env, userId, 'sticker', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
         return tgRequest(token, 'sendMessage', {
             chat_id: userId,
-            text: "🔒 <b>安全验证</b>\n\n⚫️⚫️⚫️ <b>请发送一张 Telegram 贴纸</b> ⚫️⚫️⚫️\n\n<b>注意：必须是“贴纸 / Sticker”，不是图片、表情、文字。</b>\n\n✅ 发送任意贴纸即可通过验证。\n⏳ 请在 <b>2 分钟</b> 内完成。",
+            text: "🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n⚫️⚫️⚫️ <b>请发送一张 Telegram 贴纸或表情</b> ⚫️⚫️⚫️\n\n<b>注意：贴纸 / Sticker 或纯表情都可以，不是图片、文件或普通文字。</b>\n\n✅ 发送任意贴纸或表情即可通过验证。\n⏳ 请在 <b>2 分钟</b> 内完成。",
             parse_mode: 'HTML'
         });
     } else if (mode === 'math') {
         const a = Math.floor(Math.random() * 10), b = Math.floor(Math.random() * 10);
         await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'math', ans: a + b }), { expirationTtl: 180 });
         await upsertVerifySession(env, userId, 'math', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-        return tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 <b>安全验证</b>\n\n请计算结果（直接发送数字）: ${a} + ${b} = ?\n\n请在 2 分钟内完成验证。`, parse_mode: 'HTML' });
+        return tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n请计算结果（直接发送数字）: ${a} + ${b} = ?\n\n请在 2 分钟内完成验证。`, parse_mode: 'HTML' });
     } else if (mode === 'button_math') {
         const challenge = await buildButtonMathChallenge(env, userId);
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: challenge.text, parse_mode: 'HTML', reply_markup: challenge.reply_markup });
@@ -2105,35 +2183,16 @@ async function completeQuestionVerification(env, groupId, msg, userId, token, pe
     if (reverifyPending) {
         await env.KV.delete(`reverify_pending:${userId}`);
         if (reverifyPending.reason === 'inactive') {
-            await tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 重新验证通过，正在转接您的消息。' });
-            const originalMsg = await pullVerificationMessage(env, userId, msg);
-            return relayVerifiedMessage(env, groupId, originalMsg, userId, token);
+            await markUserVerificationPassed(env, userId, msg);
+            if (env.KV) await env.KV.delete(`verify_original:${userId}`);
+            return tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 验证已恢复。刚才那条消息不会保存或转发，请重新发送。' });
         } else {
             await unbanUser(env, userId);
             await tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 重新验证通过，您可以继续聊天。' });
             return;
         }
     }
-    await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，正在转接您的消息。" });
-    const originalMsg = await pullVerificationMessage(env, userId, msg);
-    return initializeUser(env, groupId, originalMsg, userId, token, { verifiedJustNow: true });
-}
-async function relayVerifiedMessage(env, groupId, msg, userId, token) {
-    const userData = await getUser(env, userId);
-    if (!userData) return initializeUser(env, groupId, msg, userId, token);
-    await upsertUser(env, { ...userData, user_id: String(userId), is_verified: true, is_banned: false });
-    if (msg.text === '/start') return sendAlreadyVerifiedMessage(env, userId);
-    if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
-    const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
-    const targetId = groupId || env.OWNER_ID;
-    if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(await getLang(env, msg), 'not_bound') });
-    if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
-    const userButton = getUserLinkButton(userId, msg.from || {});
-    const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
-    await sendUserForwardFeedback(env, userId, forwarded && forwarded.ok === false ? `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` : '✅ 消息已发送。');
-    if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
-    if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
-    return forwarded;
+    return finishInitialVerification(env, userId, msg, token);
 }
 async function handleReverifyCallback(env, query) {
     const token = env.BOT_TOKEN;
@@ -2199,11 +2258,12 @@ async function generateSettingsMenu(env, page = 'main') {
     const inactiveHours = await getVerifyInactiveHours(env);
     const inactiveDisplay = formatInactiveHours(inactiveHours);
     const appealUrl = await getAppealUrl(env);
+    const unionAppealUrl = await getUnionAppealUrl(env);
     const businessStatus = await getConfig(env, 'business_status', 'open');
     const aiTranslate = await getConfig(env, 'ai_translate', '0');
     const unionStatus = unionBan ? '🟢 开启' : '🔴 关闭';
     const verifySettings = await getVerifySettings(env);
-    const verifyLabels = { off: '🔴 关闭', math: '🔢 数学题', button_math: '🔘 算数按钮', sticker: '🎨 贴纸', emoji_choice: '😺 表情选择', word_button: '🔤 文字按钮', image_digit: '🖼 图片数字', custom_question: '❓ 自定义问答' };
+    const verifyLabels = { off: '🔴 关闭', math: '🔢 数学题', button_math: '🔘 算数按钮', sticker: '🎨 贴纸/表情', emoji_choice: '😺 表情选择', word_button: '🔤 文字按钮', image_digit: '🖼 图片数字', custom_question: '❓ 自定义问答' };
     const captchaLabels = { off: '🔴 无验证码', cloudflare_turnstile: '🛡 Turnstile', google_recaptcha: '🧩 reCAPTCHA' };
     const comboLabels = { captcha_only: '只验证码', question_only: '只问答', captcha_question: '验证码+问答' };
     const verifyDisplay = `${comboLabels[verifySettings.comboMode] || '只问答'} / ${captchaLabels[verifySettings.captchaMode] || '🔴 无验证码'} / ${verifyLabels[verifySettings.questionMode] || '🔴 关闭'}`;
@@ -2214,37 +2274,64 @@ async function generateSettingsMenu(env, page = 'main') {
     const langDisplay = ({ auto: '🌐 自动', zh: '🇨🇳 中文', en: '🇬🇧 English' })[language] || '🌐 自动';
     if (page === 'antispam') {
         return {
-            text: `🛡 <b>防骚扰设置</b>\n\n状态：${antiStatus}\n链接拦截：${anti.blockLinks ? '🟢 开启' : '🔴 关闭'}\n媒体限制：${anti.blockMedia ? '🟢 开启' : '🔴 关闭'}\n关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n命中自封：${anti.autoBan ? '🟢 开启' : '🔴 关闭'}`,
+            text: `🛡 <b>安全 / 防骚扰</b>\n\n状态：${antiStatus}\n链接拦截：${anti.blockLinks ? '🟢 开启' : '🔴 关闭'}\n媒体限制：${anti.blockMedia ? '🟢 开启' : '🔴 关闭'}\n关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n命中自封：${anti.autoBan ? '🟢 开启' : '🔴 关闭'}`,
             reply_markup: { inline_keyboard: [
                 [{ text: `🛡 总开关：${antiStatus}`, callback_data: 'toggle_antispam' }],
                 [{ text: `🔗 链接拦截：${anti.blockLinks ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_link' }, { text: `🖼 媒体限制：${anti.blockMedia ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_media' }],
                 [{ text: `🚫 关键词：${anti.blockKeywords ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_keyword' }, { text: `⚡ 命中自封：${anti.autoBan ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_autoban' }],
                 [{ text: '📝 关键词管理', callback_data: 'guide_keywords' }],
-                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+                [{ text: '🔙 返回安全目录', callback_data: 'menu_security' }]
             ] }
         };
     }
     if (page === 'verify') {
         return {
-            text: `🧩 <b>人机验证</b>\n\n当前：${verifyDisplay}\n失败封禁：${failLimit} 次\n长期未聊重验：${inactiveDisplay}`,
+            text: `🧩 <b>安全 / 人机验证</b>\n\n当前：${verifyDisplay}\n失败封禁：${failLimit} 次\n验证过期周期：${inactiveDisplay}`,
             reply_markup: { inline_keyboard: [
                 [{ text: `🔗 组合：${comboLabels[verifySettings.comboMode] || '只问答'}`, callback_data: 'cycle_verify_combo' }],
                 [{ text: `🧩 云端验证码：${captchaLabels[verifySettings.captchaMode] || '🔴'}`, callback_data: 'cycle_verify_captcha' }],
                 [{ text: `❓ 本地问答：${verifyLabels[verifySettings.questionMode] || '🔴'}`, callback_data: 'cycle_verify_local' }],
                 [{ text: `❌ 失败封禁：${failLimit}次`, callback_data: 'cycle_verify_fail_limit' }],
-                [{ text: `⏳ 未聊重验：${inactiveDisplay}`, callback_data: 'cycle_verify_inactive' }],
-                [{ text: '🔗 申诉设置', callback_data: 'guide_appeal' }],
+                [{ text: `⏳ 验证过期：${inactiveDisplay}`, callback_data: 'cycle_verify_inactive' }],
+                [{ text: '🔙 返回安全目录', callback_data: 'menu_security' }]
+            ] }
+        };
+    }
+    if (page === 'runtime') {
+        return {
+            text: `🏪 <b>运营 / 中继</b>\n\n营业状态：${businessDisplay}\nAI 翻译：${aiDisplay}\n\n休息模式会拦截普通用户消息并按冷却时间回复忙碌提示；管理员仍可正常回复。`,
+            reply_markup: { inline_keyboard: [
+                [{ text: `🏪 营业状态：${businessDisplay}`, callback_data: 'toggle_business' }],
+                [{ text: `🤖 AI 翻译：${aiDisplay}`, callback_data: 'toggle_ai_translate' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
+    if (page === 'security') {
+        return {
+            text: `🛡 <b>安全目录</b>\n\n人机验证：${verifyDisplay}\n防骚扰：${antiStatus}\n关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n联合封禁：${unionStatus}\n失败封禁：${failLimit} 次`,
+            reply_markup: { inline_keyboard: [
+                [{ text: '🧩 人机验证', callback_data: 'menu_verify' }, { text: '🛡 防骚扰', callback_data: 'menu_antispam' }],
+                [{ text: `🌐 联合封禁：${unionStatus}`, callback_data: 'toggle_union' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
+    if (page === 'users') {
+        return {
+            text: `👥 <b>用户 / 权限</b>\n\n本地申诉：${appealUrl ? escapeHtml(appealUrl) : 'Bot 内填写理由'}\n联合申诉：${escapeHtml(unionAppealUrl || '未设置')}\n\n协管、黑名单和申诉建议优先在网页后台管理。`,
+            reply_markup: { inline_keyboard: [
+                [{ text: '👮 协管列表', callback_data: 'admin_list' }],
+                [{ text: '🔗 申诉设置说明', callback_data: 'guide_appeal' }],
                 [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
             ] }
         };
     }
     if (page === 'system') {
         return {
-            text: `⚙️ <b>系统与配置</b>\n\n联合封禁：${unionStatus}\n语言：${langDisplay}\nAI 翻译：${aiDisplay}`,
+            text: `⚙️ <b>系统 / 工具</b>\n\n语言：${langDisplay}\n导入导出只处理业务配置，不包含 BOT_TOKEN、OWNER_ID 或 D1 绑定名。`,
             reply_markup: { inline_keyboard: [
-                [{ text: `🌐 联合封禁：${unionStatus}`, callback_data: 'toggle_union' }],
                 [{ text: `🌐 语言：${langDisplay}`, callback_data: 'cycle_language' }],
-                [{ text: `🤖 AI 翻译：${aiDisplay}`, callback_data: 'toggle_ai_translate' }],
                 [{ text: '📤 导出配置', callback_data: 'export_config' }, { text: '📥 导入说明', callback_data: 'guide_import' }],
                 [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
             ] }
@@ -2252,7 +2339,7 @@ async function generateSettingsMenu(env, page = 'main') {
     }
     if (page === 'messages') {
         return {
-            text: `👋 <b>欢迎与回复设置</b>\n\n自动回复：${replyStatus}\n\n欢迎语、品牌文案、按钮支持在网页后台修改；也可用 /welcome、/brand、/welbtn、/reply 命令。`,
+            text: `📝 <b>内容 / 文案</b>\n\n自动回复：${replyStatus}\n\n欢迎语、品牌文案、按钮支持在网页后台修改；也可用 /welcome、/brand、/welbtn、/reply 命令。`,
             reply_markup: { inline_keyboard: [
                 [{ text: '👋 欢迎消息说明', callback_data: 'guide_welcome' }],
                 [{ text: '🤖 自动回复说明', callback_data: 'guide_reply' }],
@@ -2261,12 +2348,11 @@ async function generateSettingsMenu(env, page = 'main') {
             ] }
         };
     }
-    const info = `🛠 <b>${escapeHtml(botUsername)} 管理面板</b>\n\n📊 <b>当前配置:</b>\n🔸 营业状态：${businessDisplay}\n🔸 AI 翻译：${aiDisplay}\n🔸 防骚扰：${antiStatus}\n🔸 链接拦截：${anti.blockLinks ? '🟢 开启' : '🔴 关闭'}\n🔸 媒体限制：${anti.blockMedia ? '🟢 开启' : '🔴 关闭'}\n🔸 关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n🔸 多语言：${langDisplay}\n🔸 联合封禁：${unionStatus}\n🔸 人机验证：${verifyDisplay}\n🔸 失败封禁：${failLimit} 次\n🔸 申诉链接：${escapeHtml(appealUrl)}\n🔸 自动回复：${replyStatus}\n\n👇 点击下方按钮修改设置`;
+    const info = `🛠 <b>${escapeHtml(botUsername)} 管理面板</b>\n\n📊 <b>当前配置:</b>\n🔸 营业状态：${businessDisplay}\n🔸 AI 翻译：${aiDisplay}\n🔸 人机验证：${verifyDisplay}\n🔸 防骚扰：${antiStatus}\n🔸 关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n🔸 联合封禁：${unionStatus}\n🔸 自动回复：${replyStatus}\n🔸 本地申诉：${appealUrl ? escapeHtml(appealUrl) : 'Bot 内填写理由'}\n\n👇 按目录进入设置`;
     const keyboard = { inline_keyboard: [
-        [{ text: `🏪 ${businessDisplay}`, callback_data: 'toggle_business' }, { text: `🌐 AI翻译：${aiDisplay}`, callback_data: 'toggle_ai_translate' }],
-        [{ text: '🛡 防骚扰设置 ➡️', callback_data: 'menu_antispam' }, { text: '🧩 人机验证 ➡️', callback_data: 'menu_verify' }],
-        [{ text: '⚙️ 系统与配置 ➡️', callback_data: 'menu_system' }, { text: '👮 协管列表', callback_data: 'admin_list' }],
-        [{ text: '👋 欢迎与回复 ➡️', callback_data: 'menu_messages' }, { text: '📢 群发广播', callback_data: 'guide_broadcast' }],
+        [{ text: '🏪 运营中继 ➡️', callback_data: 'menu_runtime' }, { text: '🛡 安全验证 ➡️', callback_data: 'menu_security' }],
+        [{ text: '📝 内容文案 ➡️', callback_data: 'menu_messages' }, { text: '👥 用户权限 ➡️', callback_data: 'menu_users' }],
+        [{ text: '⚙️ 系统工具 ➡️', callback_data: 'menu_system' }],
         [{ text: '🔄 刷新', callback_data: 'refresh_menu' }]
     ] };
     return { text: info, reply_markup: keyboard };
@@ -2333,7 +2419,7 @@ async function handleOwnerCallback(env, query) {
             await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已封禁用户' });
         }
         else if (action === 'spam_trust') { await env.KV.put(`trusted:${targetId}`, '1'); await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已加入白名单' }); }
-        else if (action === 'spam_allow') { const raw = await env.KV.get(`spam:last:${targetId}`); if (!raw) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '原消息已过期', show_alert: true }); const savedMsg = JSON.parse(raw); const userData = await getUser(env, targetId); const groupId = await getConfig(env, 'group_id'); if (groupId && userData && userData.thread_id) await forwardMessage(env, token, groupId, targetId, savedMsg, userData.thread_id); else if (groupId) await initializeUser(env, groupId, savedMsg, targetId, token); await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已放行' }); }
+        else if (action === 'spam_allow') { await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '当前版本不缓存原消息，请让用户重新发送', show_alert: true }); }
         try { await tgRequest(token, 'editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }); } catch (e) { }
         return;
     }
@@ -2478,7 +2564,7 @@ async function handleOwnerMenu(env, msg, ctx) {
     let text = msg.text || '';
 
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.23 (Settings Tabs UI)\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：2.1.3\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
     }
 
     if (['/menu', '/cancel'].includes(text)) {
@@ -2868,25 +2954,27 @@ async function handlePrivateOnlyUserMessage(env, msg, userId, userData, options 
         is_verified: true,
         is_banned: false
     };
-    await upsertUser(env, next);
     if (msg.text === '/start') {
         if (options.verifiedJustNow) return sendWelcomeMessage(env, userId, { includeBrand: true });
         return sendAlreadyVerifiedMessage(env, userId);
     }
     if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
     if (!ownerId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(await getLang(env, msg), 'not_bound') });
-    if (options.verifiedJustNow) await sendWelcomeMessage(env, userId, { includeBrand: true });
-    await sendUserIdentityCard(env, ownerId, null, userId, info, '📩 新私聊消息');
-    const userButton = getUserLinkButton(userId, info);
-    const forwarded = await forwardMessage(env, token, ownerId, userId, msg, null, { reply_markup: { inline_keyboard: [[userButton]] } });
-    if (forwarded && !forwarded.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
     await sendUserForwardFeedback(env, userId);
-    await maybeTranslateToChinese(env, ownerId, null, msg);
-    return forwarded;
+    runBackground(options.ctx, async () => {
+        await upsertUser(env, next);
+        if (options.verifiedJustNow) await sendWelcomeMessage(env, userId, { includeBrand: true });
+        const userButton = getUserLinkButton(userId, info);
+        const forwarded = await forwardMessage(env, token, ownerId, userId, msg, null, { reply_markup: { inline_keyboard: [[userButton]] } });
+        if (forwarded && !forwarded.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
+        await sendUserIdentityCard(env, ownerId, null, userId, info, '📩 新私聊消息');
+        await maybeTranslateToChinese(env, ownerId, null, msg);
+    });
+    return { ok: true };
 }
 
 // 用户私聊核心逻辑
-async function handleUserPrivateMessage(env, groupId, msg) {
+async function handleUserPrivateMessage(env, groupId, msg, ctx = null) {
     const userId = String(msg.from.id);
     const token = env.BOT_TOKEN;
     const lang = await getLang(env, msg);
@@ -2960,10 +3048,10 @@ async function handleUserPrivateMessage(env, groupId, msg) {
 
     const verifySettings = await getVerifySettings(env);
     if (userData && (userData.thread_id || userData.is_verified) && await shouldReverifyInactive(env, userData, verifySettings, isUnionBanEnabled)) {
-        await rememberVerificationMessage(env, userId, msg);
+        await discardVerificationMessage(env, userId);
         await env.KV.put(`reverify_pending:${userId}`, JSON.stringify({ thread_id: userData.thread_id || null, reason: 'inactive', last_seen: userData.last_seen || 0 }), { expirationTtl: 1800 });
         await upsertVerifySession(env, userId, 'inactive_reverify', 'started', 0, 600);
-        await tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 你已经超过 ${formatInactiveHours(await getVerifyInactiveHours(env))} 未发送消息，需要重新验证后再继续。` });
+        await tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 会话验证已过期\n\n你已超过 ${formatInactiveHours(await getVerifyInactiveHours(env))} 未发送消息，需要重新验证后再继续。\n\n为了安全，刚才这条消息不会保存或转发；验证通过后请重新发送。` });
         if (shouldRunCaptcha(verifySettings, isUnionBanEnabled)) return startCaptchaVerification(env, groupId, msg, userId, token, verifySettings, isUnionBanEnabled);
         return handleLocalVerification(env, groupId, msg, userId, token, verifySettings.questionMode);
     }
@@ -2971,14 +3059,12 @@ async function handleUserPrivateMessage(env, groupId, msg) {
     // 已验证用户：支持有群 Topic，也支持无群直接转发给主人
     const isVerified = userData && (userData.thread_id || userData.is_verified);
     if (isVerified) {
-        if (groupId && !userData.thread_id) return initializeUser(env, groupId, msg, userId, token);
         if (msg.text === '/start') return sendAlreadyVerifiedMessage(env, userId);
         if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
 
         const spamCheck = await checkAntiSpam(env, groupId, msg, userData);
         if (!spamCheck.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, spamCheck.messageKey), parse_mode: 'HTML' });
 
-        const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
         if (await maybeSendRestNotice(env, userId)) return;
 
         if (!msg.media_group_id) {
@@ -2998,13 +3084,18 @@ async function handleUserPrivateMessage(env, groupId, msg) {
 
         const targetId = groupId || env.OWNER_ID;
         if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, 'not_bound') });
-        if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
-        const userButton = getUserLinkButton(userId, msg.from || {});
-        const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
-        await sendUserForwardFeedback(env, userId, forwarded && forwarded.ok === false ? `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` : '✅ 消息已发送。');
-        if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
-        if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
-        return forwarded;
+        await sendUserForwardFeedback(env, userId);
+        runBackground(ctx, async () => {
+            if (groupId && !userData.thread_id) return initializeUser(env, groupId, msg, userId, token, { ctx });
+            const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
+            if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
+            const userButton = getUserLinkButton(userId, msg.from || {});
+            const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
+            if (forwarded && forwarded.ok === false) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
+            if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
+            if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
+        });
+        return { ok: true };
     }
     // 新用户验证：支持验证码、问答、验证码+问答组合
     const captchaPassedKey = `verify_captcha_passed:${userId}`;
@@ -3017,8 +3108,10 @@ async function handleUserPrivateMessage(env, groupId, msg) {
         return startCaptchaVerification(env, groupId, msg, userId, token, verifySettings, isUnionBanEnabled);
     } else {
         if (!shouldRunQuestion(verifySettings)) {
-            if (!groupId) return handlePrivateOnlyUserMessage(env, msg, userId, userData);
-            return initializeUser(env, groupId, msg, userId, token);
+            if (!groupId) return handlePrivateOnlyUserMessage(env, msg, userId, userData, { ctx });
+            await sendUserForwardFeedback(env, userId);
+            runBackground(ctx, () => initializeUser(env, groupId, msg, userId, token, { ctx }));
+            return { ok: true };
         }
         return handleLocalVerification(env, groupId, msg, userId, token, verifySettings.questionMode);
     }
@@ -3032,11 +3125,11 @@ async function startCaptchaVerification(env, groupId, msg, userId, token, verify
     const webAppUrl = `https://t.me/${CENTRAL_BOT_USERNAME}/${CENTRAL_WEBAPP_NAME}?startapp=${payload}`;
     const providerName = verifySettings.captchaMode === 'cloudflare_turnstile' ? 'Cloudflare Turnstile' : 'Google reCAPTCHA';
     const questionTip = shouldRunQuestion(verifySettings) ? '\n\n完成验证码后还需要继续回答本地问题。' : '';
-    await rememberVerificationMessage(env, userId, msg);
+    await discardVerificationMessage(env, userId);
     await upsertVerifySession(env, userId, verifySettings.captchaMode || 'captcha', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 600);
     return tgRequest(token, 'sendMessage', {
         chat_id: userId,
-        text: `🔒 <b>安全验证</b>\n\n本机器人已开启 ${providerName} 验证，请点击下方按钮验证身份。${questionTip}\n\n请在 10 分钟内完成验证并返回。`,
+        text: `🔒 <b>安全验证</b>\n\n验证前发送的消息不会保存或转发，验证通过后请重新发送。\n\n本机器人已开启 ${providerName} 验证，请点击下方按钮验证身份。${questionTip}\n\n请在 10 分钟内完成验证并返回。`,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: "👉 点击验证 (Click to Verify)", url: webAppUrl }]] }
     });
@@ -3064,16 +3157,14 @@ async function handleUnionRefresh(env, groupId, msg, userId, token) {
         if (reverifyPending) {
             await env.KV.delete(`reverify_pending:${userId}`);
             if (reverifyPending.reason === 'inactive') {
-                await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 重新验证通过，正在转接您的消息。" });
-                const originalMsg = await pullVerificationMessage(env, userId, msg);
-                return relayVerifiedMessage(env, groupId, originalMsg, userId, token);
+                await markUserVerificationPassed(env, userId, msg);
+                await env.KV.delete(`verify_original:${userId}`);
+                return tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证已恢复。刚才那条消息不会保存或转发，请重新发送。" });
             }
             await unbanUser(env, userId);
             return tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 重新验证通过，您可以继续聊天。" });
         }
-        await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，正在转接您的消息。" });
-        const originalMsg = await pullVerificationMessage(env, userId, msg);
-        return initializeUser(env, groupId, originalMsg, userId, token, { verifiedJustNow: true });
+        return finishInitialVerification(env, userId, msg, token);
     } else {
         let debugText = "❌ 验证状态已过期。请发送 /start 重新验证。";
         if (checkRes.debug_info) {
@@ -3088,13 +3179,13 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
     const pendingState = await env.KV.get(tempKey, { type: 'json' });
 
     if (!pendingState) {
-        await rememberVerificationMessage(env, userId, msg);
+        await discardVerificationMessage(env, userId);
         return startQuestionVerification(env, groupId, msg, userId, token, mode);
     }
 
     if (pendingState) {
         let passed = false;
-        if (pendingState.type === 'sticker' && msg.sticker) passed = true;
+        if (pendingState.type === 'sticker' && (msg.sticker || isEmojiOnlyText(msg.text))) passed = true;
         else if (pendingState.type === 'math' && msg.text && parseInt(msg.text) === pendingState.ans) passed = true;
         else if (pendingState.type === 'custom_question' && msg.text && msg.text.trim().toLowerCase() === pendingState.ans) passed = true;
         if (pendingState.type === 'button_math' || pendingState.type === 'image_digit') return;
@@ -3168,8 +3259,8 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
             await upsertInboxCard(env, groupId, userId, userData, msg);
             const userButton = getUserLinkButton(userId, msg.from || {});
             await forwardMessage(env, token, groupId, userId, msg, threadId, { reply_markup: { inline_keyboard: [[userButton]] } });
-            await maybeTranslateToChinese(env, groupId, threadId, msg);
             await sendUserForwardFeedback(env, userId);
+            runBackground(options.ctx, () => maybeTranslateToChinese(env, groupId, threadId, msg));
         }
     } catch (e) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });
